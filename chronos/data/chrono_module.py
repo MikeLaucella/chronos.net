@@ -42,38 +42,55 @@ class ChronosDataModule(LightningDataModule):
 
         self._logger = logging.getLogger('chronos.data.module')
 
-        key_binding, tr_args = self._build_bindings(data_keys)
-        self._collator = ChronosCollator(key_binding, keep_query=keep_query)
+        self.key_binding, self.reverse_mapping, self.tr_args = self._build_bindings(data_keys)
+        self._collator = ChronosCollator(self.key_binding, keep_query=keep_query)
 
         self.test_transform = A.Compose([
             A.ToTensorV2()
-        ], additional_targets=tr_args)
+        ], additional_targets=self.tr_args)
 
         self.train_transform = A.Compose([
             A.ToTensorV2()
-        ], additional_targets=tr_args)
+        ], additional_targets=self.tr_args)
 
     def _build_bindings(self, data_keys: list[str]):
-        mapping = {}
+        key_mapping = {}
+        reverse_mapping = {}
         tr_args = {}
 
         for key in data_keys:
             if key == 'naip_hist':
-                mapping['image'] = key
+                key_mapping['image'] = key
+                reverse_mapping[key] = 'image'
                 tr_args['image'] = 'image'
             elif key == 'naip':
-                mapping['image1'] = key
+                key_mapping['image1'] = key
+                reverse_mapping[key] = 'image1'
                 tr_args['image1'] = 'image'
             elif key == 'eros_hist':
-                mapping['image2'] = key
+                key_mapping['image2'] = key
+                reverse_mapping[key] = 'image2'
                 tr_args['image2'] = 'image'
             elif key == 'masks':
-                mapping['masks'] = key
+                key_mapping['masks'] = key
+                reverse_mapping[key] = 'masks'
                 tr_args['masks'] = 'mask'
             else:
                 raise ValueError(f'Unknown data key: {key}')
 
-        return mapping, tr_args
+        return key_mapping, reverse_mapping, tr_args
+
+    def _filter_dataset(self, sets: dict[str, GeoArrayDataset]) -> dict[str, GeoArrayDataset]:
+        filtered = {}
+
+        for name in self.sets.keys():
+            binding = self.reverse_mapping.get(name)
+            if binding is None:
+                raise ValueError(f'No binding found for data key: {name}')
+            
+            filtered[binding] = sets[binding]
+
+        return filtered
 
     def _extract_metadata(self, z, type: str):
         metadata = z.attrs['metadata']
@@ -85,12 +102,12 @@ class ChronosDataModule(LightningDataModule):
         self._logger.info('Loading zarr root from %s', self.zarr_dir)
         _zarr_root = zarr.open(self.zarr_dir, mode='r')
 
-        self._sets = {
-            'image': GeoArrayDataset(_zarr_root['naip_hist'], channels=1, channel_offset=1),
-            'image1': GeoArrayDataset(_zarr_root['naip'], channels=3),
-            'image2': GeoArrayDataset(_zarr_root['eros_hist'], channels=1),
+        self._sets = self._filter_dataset({
+            'naip_hist': GeoArrayDataset(_zarr_root['naip_hist'], channels=1, channel_offset=1),
+            'naip': GeoArrayDataset(_zarr_root['naip'], channels=3),
+            'eros_hist': GeoArrayDataset(_zarr_root['eros_hist'], channels=1),
             'masks': GeoArrayDataset(_zarr_root['masks/urbanwatch'], channels=1)
-        }
+        })
 
         self._logger.info('Loading samplers for tiles')
         _samplers = GeoSamplerBuilder(
