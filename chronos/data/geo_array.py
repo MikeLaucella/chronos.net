@@ -32,12 +32,12 @@ class GeoArrayDataset(Dataset[dict[str, Tensor]]):
         :return: All the related data
         :rtype: np.array
         """
-        return self.images[
-            query.index,
+        image = self.images[query.index]
+        return image[
             self.channel_offset:self.channel_offset+self.channels,
             query.miny:query.maxy,
             query.minx:query.maxx
-        ].transpose(1, 2, 0)  # CxHxW -> HxWxC
+        ] # CxHxW
 
     def _get_item(self, query: BoundingBoxQuery):
         # get the image data
@@ -47,7 +47,7 @@ class GeoArrayDataset(Dataset[dict[str, Tensor]]):
         return self.transforms(image) if self.transforms else image
 
     def __len__(self) -> int:
-        return len(self.images.keys())
+        return len(self.images)
 
     def __getitem__(self, query: BoundingBoxQuery):
         # route the data fetch based on mask presence in the data

@@ -5,6 +5,7 @@ Geodata samplers for extracting bounding box queries from geodata sources.
 """
 
 from abc import abstractmethod
+from collections import Counter
 from typing import Generator
 
 import torch
@@ -38,6 +39,12 @@ class TileSampler(Sampler):
 
         # compute weights
         ent = np.array([m["entropy"] for m in metadata])
+        empty = np.array([m["percent_empty"] for m in metadata])
+        ent_norm = ent / (ent.max() + 1e-6)
+        empty_norm = empty / (empty.max() + 1e-6)
+
+        score = 0.5 * ent_norm + 0.5 * (1 - empty_norm)
+        self.p = score / (score.sum() + 1e-6)
         ent = (ent - ent.min()) / (ent.max() - ent.min() + 1e-6)
 
         # combine spatial uniformity + entropy
@@ -52,7 +59,8 @@ class TileSampler(Sampler):
         self.weights = torch.tensor(weights, dtype=torch.float)
 
     def __iter__(self):
-        return iter(torch.multinomial(self.weights, self.steps, replacement=True).tolist())
+        #return iter(torch.multinomial(self.weights, self.steps, replacement=True).tolist())
+        return iter(np.random.choice(len(self.p), self.steps, p=self.p, replace=True))
 
     def __len__(self):
         return self.steps
@@ -64,6 +72,11 @@ class WindowSampler:
     @abstractmethod
     def next(self, tile_id: int):
         """Given a tile ID, sample a window within that tile."""
+        pass
+
+    @abstractmethod
+    def next(self, tile_id: int, count: int):
+        """Given a tile ID and count, sample a window within that tile."""
         pass
 
 
@@ -88,9 +101,16 @@ class RandomUnfiformWindowSampler(WindowSampler):
         x = np.random.randint(0, W - self.window)
         return y, x
 
-    def next(self, _: int):
-        y, x = self._sample_uniform(self.height, self.width)
-        return [y, y+self.window, x, x+self.window]
+    def next(self, tile_id: int):
+        return self.next(tile_id, 1)
+
+    def next(self, _: int, count: int):
+        windows = []
+        for _ in range(count):
+            y, x = self._sample_uniform(self.height, self.width)
+            windows.append([y, y+self.window, x, x+self.window])
+
+        return windows
 
 
 class BoundaryDistWindowSampler(WindowSampler):
@@ -106,23 +126,49 @@ class BoundaryDistWindowSampler(WindowSampler):
         self.window = window
         self.boundary_ratio = boundary_ratio
 
-    def _sample_boundary(self, dist_map):
-        H, W = dist_map.shape
-        flat = dist_map.flatten().astype(np.float32)
-        p = np.exp(-flat / 5.0)
-        p /= p.sum()
+    def _sample_valid_window(self, valid_small, H, W, window, factor=8):
+        # 1. Get the list of 'True' indices from the 1/8th scale map
+        # (e.g., if the map is 875x750, these are coordinates in that range)
+        ys, xs = np.where(valid_small > 0)
+        
+        if len(ys) == 0:
+            # Fallback: if no data exists, pick a random crop in the image
+            return np.random.randint(0, H - window), np.random.randint(0, W - window)
 
-        idx = np.random.choice(len(flat), p=p)
-        y0, x0 = divmod(idx, W)
-
-        y = max(0, min(y0 - self.window // 2, H - self.window))
-        x = max(0, min(x0 - self.window // 2, W - self.window))
-        return y, x
+        # 2. Pick a random anchor
+        idx = np.random.randint(len(ys))
+        
+        # 3. SCALE UP the anchor to full resolution
+        # anchor_y and anchor_x are now in the 0-7000 range
+        anchor_y = ys[idx] * factor
+        anchor_x = xs[idx] * factor
+        
+        # 4. Add your Jitter (H//2 or W//2 of the WINDOW size)
+        # This fills in the gaps between the 8px steps and adds variety
+        half_win = window // 2
+        y_start = anchor_y - half_win + np.random.randint(-128, 128)
+        x_start = anchor_x - half_win + np.random.randint(-128, 128)
+        
+        # 5. Final Safety Clamp
+        # This prevents the 512x512 window from 'falling off' the image edges
+        y_final = np.clip(y_start, 0, H - window)
+        x_final = np.clip(x_start, 0, W - window)
+        
+        return int(y_final), int(x_final)
 
     def next(self, tile_id: int):
-        y, x = self._sample_boundary(self.boundary_dists[tile_id])
+        y, x = self._sample_valid_window(self.boundary_dists[tile_id][:], 7000, 6000, 8)
         return [y, y+self.window, x, x+self.window]
 
+    def next(self, tile_id: int, count: int):
+        windows = []
+        boundaries = self.boundary_dists[tile_id][:]
+
+        for _ in range(count):
+            y, x = self._sample_valid_window(boundaries, 7000, 6000, self.window)
+            windows.append([y, y+self.window, x, x+self.window])
+
+        return windows
 
 class TrainingSampler(Sampler):
     """Sample a number of epoch step queries from tiles"""
@@ -132,33 +178,81 @@ class TrainingSampler(Sampler):
         self.tile_sampler = tile_sampler
         self.window_sampler = window_sampler
 
-    def _generate_queries(self) -> Generator[BoundingBoxQuery, None, None]:
-        for tile in self.tile_sampler:
-            window = self.window_sampler.next(tile)
-            yield BoundingBoxQuery(
-                index=tile,
-                miny=window[0],
-                maxy=window[1],
-                minx=window[2],
-                maxx=window[3],
-            )
+    def _generate_queries(self):
+        tiles = list(self.tile_sampler)
+        tiles = Counter(tiles)
+
+        windows = []
+        for tile, count in tiles.items():
+            sampled_windows = self.window_sampler.next(tile, count)
+            for window in sampled_windows:
+                windows.append(BoundingBoxQuery(
+                    index=tile,
+                    miny=window[0],
+                    maxy=window[1],
+                    minx=window[2],
+                    maxx=window[3],
+                ))
+
+        # shuffle the windows to mix tiles together
+        np.random.shuffle(windows)
+
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            return iter(windows)
+
+        # Splice the list so workers don't duplicate effort
+        per_worker = int(np.ceil(len(windows) / float(worker_info.num_workers)))
+        worker_id = worker_info.id
+        iter_start = worker_id * per_worker
+        iter_end = min(iter_start + per_worker, len(windows))
+        return iter(windows[iter_start:iter_end])
 
     def __iter__(self):
         return iter(self._generate_queries())
 
     def __len__(self):
-        return self.steps
+        return len(self.tile_sampler)
 
 
 class TestingSampler(Sampler):
     """Sample a number of epoch step queries from tiles"""
 
-    def __init__(self, tile_metadata, window_size=512):
+    def __init__(self, tile_metadata, boundaries, window_size=512):
         super().__init__()
         self.tile_metadata = tile_metadata
         self.window_size = window_size
+        self.boundaries = boundaries
+        self.factor = 8
+        self._queries = list(self._generate_queries())
 
-    def _generate_queries(self) -> Generator[BoundingBoxQuery, None, None]:
+    def _generate_queries(self):
+        for tile in self.tile_metadata:
+            coords = self.boundaries[tile['index']][:] 
+            H, W = tile['shape']
+
+            step = self.window_size // self.factor
+            H_small = coords.shape[0]
+            W_small = coords.shape[1]
+            y_grid = np.arange(0, H_small - step + 1, step)
+            x_grid = np.arange(0, W_small - step + 1, step)
+
+            for y_s in y_grid:
+                for x_s in x_grid:
+                    if coords[y_s, x_s]:
+                        y = int(y_s * self.factor)
+                        x = int(x_s * self.factor)
+                        y_start = int(max(0, min(y, H - self.window_size)))
+                        x_start = int(max(0, min(x, W - self.window_size)))
+                        yield BoundingBoxQuery(
+                            index=tile['index'],
+                            miny=y_start,
+                            maxy=y_start + self.window_size, # Fixed Size
+                            minx=x_start,
+                            maxx=x_start + self.window_size, # Fixed Size
+                        )
+
+    def _generate_queries2(self) -> Generator[BoundingBoxQuery, None, None]:
         for tile in self.tile_metadata:
             H, W = tile['shape']
             for y in range(0, H, self.window_size):
@@ -173,10 +267,10 @@ class TestingSampler(Sampler):
                     )
 
     def __iter__(self):
-        return iter(self._generate_queries())
+        return iter(self._queries)
 
     def __len__(self):
-        return self.steps
+        return len(self._queries)
 
 
 class GeoSamplerBuilder:
@@ -194,26 +288,25 @@ class GeoSamplerBuilder:
         self.steps_per_epoch = steps_per_epoch
         self.boundary_dists = boundary_dists
 
-    def _validate(self):
-        if self.boundary_dists is None:
-            raise ValueError("Boundary distance maps must be provided")
-
     def testing(self, tiles):
-        return TestingSampler(tiles, window_size=self.window_size)
+        return TestingSampler(tiles, self.boundary_dists, window_size=self.window_size)
 
     def validation(self, tiles):
-        return TestingSampler(tiles, window_size=self.window_size)
+        return TestingSampler(tiles, self.boundary_dists, window_size=self.window_size)
 
     def training(self, tiles) -> Sampler:
-        self._validate()
         tile_sampler = TileSampler(
             tiles,
             steps_per_epoch=self.steps_per_epoch,
             entropy_weight=self.entropy_weight)
 
-        window_sampler = BoundaryDistWindowSampler(
-            boundary_dists=self.boundary_dists,
-            window=self.window_size,
-            boundary_ratio=self.boundary_ratio)
+        if self.boundary_dists:
+            window_sampler = BoundaryDistWindowSampler(
+                boundary_dists=self.boundary_dists,
+                window=self.window_size,
+                boundary_ratio=self.boundary_ratio)
+        else:
+            window_sampler = RandomUnfiformWindowSampler(
+                7000, 6000, self.window_size)
 
         return TrainingSampler(tile_sampler, window_sampler)

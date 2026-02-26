@@ -15,31 +15,33 @@ from chronos.data.models import BoundingBoxQuery
 class ChronosCollator:
     """Collator class implementation"""
 
-    def __init__(self, name_mapping: dict[str, str], keep_query: bool = False):
-        self.name_mapping = name_mapping
+    def __init__(self, keep_query: bool = False):
         self.keep_query = keep_query
 
     def __call__(self, batch: list[dict]) -> dict:
-        batched = { real_name: [] for real_name in self.name_mapping.values() }
+        batched = {}
         query = []
 
         for data in batch:
-            for ds_name, real_name in self.name_mapping.items():
-                if ds_name not in data:
-                    raise ValueError(f"Missing key {ds_name} in batch data")
-                batched[real_name].append(data[ds_name])
-            
+            for key, value in data.items():
+                if key == 'query':
+                    continue
+                if key not in batched:
+                    batched[key] = []
+
+                batched[key].append(value)
+
             if self.keep_query and 'query' in data:
                 query.append(data['query'])
 
         out = {
-            key: torch.stack(batched[key], dim=0).to(dtype=torch.float32)
-            for key in self.name_mapping.values()
+            key: torch.stack(batched[key], dim=0)
+            for key in batched.keys()
         }
-    
+
         if self.keep_query:
             out['query'] = query
-    
+
         return out
 
 
@@ -53,6 +55,14 @@ class ChronosDataset(Dataset[dict[str, Tensor]]):
         self.input_sets = input_sets
         self.transforms = transforms
         self.keep_query = keep_query
+        self.length = self._verify_lengths()
+
+    def _verify_lengths(self):
+        lengths = {len(ds) for ds in self.input_sets.values()}
+        if len(set(lengths)) != 1:
+            raise ValueError(f"Inconsistent dataset lengths: {lengths}")
+
+        return list(lengths)[0]
 
     def _get_item(self, query: BoundingBoxQuery):
         # get the image data
@@ -63,16 +73,16 @@ class ChronosDataset(Dataset[dict[str, Tensor]]):
         output = dict(**input_data)
 
         # apply transforms
-        output = self.transforms(**output) if self.transforms \
+        output = self.transforms(output) if self.transforms \
             else output
 
         if self.keep_query:
             output['query'] = query
-        
+
         return output
 
     def __len__(self) -> int:
-        return len(self.historical_set.keys())
+        return self.length
 
     def __getitem__(self, query: BoundingBoxQuery):
         # route the data fetch based on mask presence in the data
