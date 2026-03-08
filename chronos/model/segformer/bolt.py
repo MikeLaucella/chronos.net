@@ -49,6 +49,34 @@ def color_label(label):
     return rgb.permute(0, 3, 1, 2).float() / 255.0
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2, ignore_index=255, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        # Compute standard cross entropy loss (with no reduction initially)
+        ce_loss = F.cross_entropy(
+            inputs, targets, reduction='none', ignore_index=self.ignore_index
+        )
+        
+        # Calculate pt (probability of the ground truth class)
+        pt = torch.exp(-ce_loss)
+        
+        # Calculate the focal loss component
+        focal_loss = self.alpha * (1 - pt)**self.gamma * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
 class SegmentationMetrics(nn.Module):
     """Segmentation metrics for evaluation."""
 
@@ -57,6 +85,7 @@ class SegmentationMetrics(nn.Module):
         self.acc = Accuracy(task="multiclass", num_classes=num_classes, ignore_index=0)
         self.iou = JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=0)
         self.loss = F.cross_entropy
+        #self.loss = FocalLoss(gamma=2, ignore_index=0)
 
     def _score_empty(self, y: torch.Tensor, y_hat: torch.Tensor) -> dict:
         """Score empty predictions."""
@@ -215,10 +244,10 @@ class SegformerBolt(LightningModule):
         # 4. Concatenate for a 4x4 Grid [Rows: NAIP, GT, Pred, EROS]
         # combined shape: [16, 3, H, W]
         combined1 = torch.cat([naip_vis, gt_vis, naip_pred_vis], dim=0)
-        grid1 = to_wandb_uint8(torchvision.utils.make_grid(combined1, nrow=4))
+        grid1 = to_wandb_uint8(torchvision.utils.make_grid(combined1, nrow=3))
 
         combined2 = torch.cat([eros_vis, gt_vis, eros_pred_vis], dim=0)
-        grid2 = to_wandb_uint8(torchvision.utils.make_grid(combined2, nrow=4))
+        grid2 = to_wandb_uint8(torchvision.utils.make_grid(combined2, nrow=3))
 
         # 5. Log to WandB / TensorBoard
         self.logger.log_image(key=f"NAIP_{type}", images=[grid1])

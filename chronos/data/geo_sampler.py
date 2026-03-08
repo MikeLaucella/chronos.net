@@ -170,7 +170,7 @@ class BoundaryDistWindowSampler(WindowSampler):
 
         return windows
 
-class TrainingSampler(Sampler):
+class SlidingSampler(Sampler):
     """Sample a number of epoch step queries from tiles"""
 
     def __init__(self, tile_sampler: TileSampler, window_sampler: WindowSampler):
@@ -196,17 +196,7 @@ class TrainingSampler(Sampler):
 
         # shuffle the windows to mix tiles together
         np.random.shuffle(windows)
-
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            return iter(windows)
-
-        # Splice the list so workers don't duplicate effort
-        per_worker = int(np.ceil(len(windows) / float(worker_info.num_workers)))
-        worker_id = worker_info.id
-        iter_start = worker_id * per_worker
-        iter_end = min(iter_start + per_worker, len(windows))
-        return iter(windows[iter_start:iter_end])
+        return iter(windows)
 
     def __iter__(self):
         return iter(self._generate_queries())
@@ -215,7 +205,7 @@ class TrainingSampler(Sampler):
         return len(self.tile_sampler)
 
 
-class TestingSampler(Sampler):
+class FixedGridSampler(Sampler):
     """Sample a number of epoch step queries from tiles"""
 
     def __init__(self, tile_metadata, boundaries, window_size=512):
@@ -273,6 +263,41 @@ class TestingSampler(Sampler):
         return len(self._queries)
 
 
+class StaticSampler(Sampler):
+    """A static sampler that returns a fixed set of queries."""
+
+    def __init__(self, queries: list[BoundingBoxQuery], shuffle: bool=True, pad: tuple[int, int]=None):
+        super().__init__()
+        self.shuffle = shuffle
+        self.queries = self._pad_queries(queries, pad)
+
+    def _pad_queries(self, queries: list[BoundingBoxQuery], pad) -> list[BoundingBoxQuery]:
+        if not pad:
+            return queries
+
+        pad_y, pad_x = pad
+        return [
+            BoundingBoxQuery(
+                index=query.index,
+                miny=max(0, query.miny - pad_y),
+                maxy=min(7000, query.maxy + pad_y),
+                minx=max(0, query.minx - pad_x),
+                maxx=min(6000, query.maxx + pad_x)
+            )
+            for query in queries
+        ]
+
+    def __iter__(self):
+        queries = self.queries
+        if self.shuffle:
+            np.random.shuffle(queries)
+
+        return iter(queries)
+
+    def __len__(self):
+        return len(self.queries)
+
+
 class GeoSamplerBuilder:
     """Builder to create ChronosSampler with different strategies."""
 
@@ -288,13 +313,13 @@ class GeoSamplerBuilder:
         self.steps_per_epoch = steps_per_epoch
         self.boundary_dists = boundary_dists
 
-    def testing(self, tiles):
-        return TestingSampler(tiles, self.boundary_dists, window_size=self.window_size)
+    def grid_sampler(self, tiles):
+        return FixedGridSampler(tiles, self.boundary_dists, window_size=self.window_size)
 
-    def validation(self, tiles):
-        return TestingSampler(tiles, self.boundary_dists, window_size=self.window_size)
+    def static_sampler(self, queries: list[BoundingBoxQuery], shuffle: bool=True, pad: tuple[int, int]=None):
+        return StaticSampler(queries, shuffle=shuffle, pad=pad)
 
-    def training(self, tiles) -> Sampler:
+    def dynamic_sampler(self, tiles) -> Sampler:
         tile_sampler = TileSampler(
             tiles,
             steps_per_epoch=self.steps_per_epoch,
@@ -309,4 +334,4 @@ class GeoSamplerBuilder:
             window_sampler = RandomUnfiformWindowSampler(
                 7000, 6000, self.window_size)
 
-        return TrainingSampler(tile_sampler, window_sampler)
+        return SlidingSampler(tile_sampler, window_sampler)

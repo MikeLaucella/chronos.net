@@ -174,7 +174,7 @@ class FDABolt(LightningModule):
         self.class_weights = get_weights()  # Class imbalance weights
         self.class_counts = get_counts()
         self.target_dist = self.class_counts / self.class_counts.sum()
-        self.ent_switch = 50_000 / 16 # after 50k samples, start applying entropy loss (adjusted for batch size of 16)
+        self.ent_switch = 78 * 5#50_000 / 16 # after 50k samples, start applying entropy loss (adjusted for batch size of 16)
 
     def forward(self, inp: dict) -> torch.Tensor:
         """Perform forward pass"""

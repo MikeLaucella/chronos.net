@@ -6,6 +6,7 @@ The transformation utilities for Chronos dataset.
 
 from abc import abstractmethod
 import albumentations as A
+import numpy as np
 import torch
 
 
@@ -13,6 +14,18 @@ class Transform:
     @abstractmethod
     def __call__(self, sample: dict[str, any]) -> dict[str, any]:
         pass
+
+
+class ChooseOne(Transform):
+    def __init__(self, name: str, options: list[str], p: list[float]):
+        self.name = name
+        self.options = options
+        self.p = p
+
+    def __call__(self, sample: dict[str, any]) -> dict[str, any]:
+        chosen = np.random.choice(self.options, p=self.p)
+        sample[self.name] = sample[chosen]
+        return sample
 
 
 class Compose(Transform):
@@ -109,6 +122,29 @@ class FDA(Transform):
 
         src = sample[self.source_key]
         ref = sample[self.ref_key]
+        sample[self.source_key] = self.fda(image=src, reference_image=[ref])['image']
+        return sample
+
+
+class MaskAwareFDA(Transform):
+    def __init__(self,
+                 source_key: str,
+                 ref_key: str,
+                 mask_key: str,
+                 beta_limit: float | tuple[float, float] = None,
+                 p: float=0.5):
+        self.source_key = source_key
+        self.ref_key = ref_key
+        self.mask_key = mask_key
+        self.fda = A.FDA(metadata_key='reference_image', p=p, beta_limit=beta_limit)
+
+    def __call__(self, sample: dict[str, any]) -> dict[str, any]:
+        if self.source_key not in sample or self.ref_key not in sample or self.mask_key not in sample:
+            return sample
+
+        src = sample[self.source_key]
+        ref = sample[self.ref_key]
+        mask = sample[self.mask_key]
         sample[self.source_key] = self.fda(image=src, reference_image=[ref])['image']
         return sample
 

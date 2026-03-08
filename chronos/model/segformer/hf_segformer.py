@@ -16,6 +16,17 @@ class HfSegformer(nn.Module):
         super().__init__()
         self.segformer = segformer
 
+    def full(self, image: torch.Tensor):
+        """Full forward pass with loss calculation."""
+        out = self.segformer(image, output_hidden_states=True)
+        out.logits = torch.nn.functional.interpolate(
+            input=out.logits,
+            size=(512, 512),#image.shape[-2:],
+            mode='bilinear',
+            align_corners=False)
+        
+        return out
+
     def forward(self, image: torch.Tensor) -> torch.Tensor:
         """Forward pass."""
         out = self.segformer(image)

@@ -57,41 +57,46 @@ class ChronosDataModule(LightningDataModule):
         begin_transforms = T.Compose([
             T.Squeeze(keys=['masks']),
             T.ToChannelLast(keys=['naip_hist', 'naip', 'eros_hist']),
-            T.ImageTransform(images=['naip_hist', 'naip', 'eros_hist', 'masks'], aug=A.Resize(512, 512))
+            T.ImageTransform(images=['naip_hist', 'naip', 'eros_hist', 'masks'], aug=A.Resize(512, 512)),
+            #T.ImageTransform(images=['naip_hist', 'eros_hist'], aug=A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0)),
         ])
 
         end_transforms = T.Compose([
             T.ImageTransform(images=['naip_hist', 'eros_hist'], aug=A.ToRGB()),
-            T.ImageTransform(images=['eros_hist'], aug=A.Normalize(mean=[mu, mu, mu], std=[sigma, sigma, sigma])),
-            T.ImageTransform(images=['naip_hist'], aug=A.Normalize(mean=[mu, mu, mu], std=[sigma, sigma, sigma])),
+            T.ImageTransform(images=['naip'], aug=A.ToGray(p=1.0)),
+            T.ImageTransform(images=['eros_hist', 'naip_hist', 'naip'], aug=A.Normalize(mean=[mu, mu, mu], std=[sigma, sigma, sigma])),
             T.ToTensor(keys=['naip_hist', 'naip', 'eros_hist', 'masks']),
             T.ToType(keys=['masks'], dtype=torch.long)
         ])
 
         deform_transforms = A.Compose([
-            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.05, p=0.3),
+            A.CoarseDropout(p=0.2),
+            A.RandomBrightnessContrast(brightness_limit=(0.1, 0.3), contrast_limit=(-0.3, -0.1), p=0.5),
             A.OneOf([
                 A.GaussianBlur(blur_limit=(3, 5), p=0.5),
                 A.MotionBlur(blur_limit=3, p=0.5)
-            ], p=0.2),
+            ], p=0.3),
             A.GaussNoise(std_range=(0.2, 0.3), p=0.3),
         ])
 
         geometric_transforms = T.JointAlbumentationTransforms(
-            augs=[A.D4(p=1.0)],
+            augs=[
+                A.D4(p=1.0),
+                A.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), p=0.4),
+            ],
             images=self.image_keys,
             masks=self.mask_keys
         )
 
         self.test_transform = T.Compose([
             begin_transforms,
-            T.FDA('naip_hist', 'eros_hist', beta_limit=(0.01, 0.04), p=1.0),
+            T.MaskAwareFDA('naip_hist', 'eros_hist', 'masks', beta_limit=(0.01, 0.02), p=0.5),
             end_transforms])
 
         self.train_transform = T.Compose([
             begin_transforms,
             geometric_transforms,
-            T.FDA('naip_hist', 'eros_hist', beta_limit=(0.01, 0.04), p=1.0),
+            T.MaskAwareFDA('naip_hist', 'eros_hist', 'masks', beta_limit=(0.01, 0.02), p=0.5),
             #T.ImageTransform(images=['naip_hist'], aug=deform_transforms),
             end_transforms
         ])
@@ -112,32 +117,45 @@ class ChronosDataModule(LightningDataModule):
     def _filter_dataset(self, sets: dict[str, GeoArrayDataset]) -> dict[str, GeoArrayDataset]:
         return {key: ds for key, ds in sets.items() if key in self.data_keys}
 
-    def _extract_metadata(self, z, type: str):
-        metadata = z.attrs['metadata']
+    def _extract_metadata(self, type: str):
+        metadata = self._zarr_root.root.attrs['metadata']
         return [metadata['tiles'][i] for i in metadata[type]]
 
     def setup(self, stage: str = None):
         """Setup the datasets and geo index."""
         # setup the zarr dataset
         self._logger.info('Loading zarr root from %s', self.zarr_dir)
-        _zarr_root = LazyZarr(self.zarr_dir)
+        self._zarr_root = LazyZarr(self.zarr_dir)
 
         self._sets = self._filter_dataset({
-            'naip_hist': GeoArrayDataset(_zarr_root['naip_hist'], channels=1),
-            'naip': GeoArrayDataset(_zarr_root['naip'], channels=3),
-            'eros_hist': GeoArrayDataset(_zarr_root['eros_hist'], channels=1),
-            'masks': GeoArrayDataset(_zarr_root['masks/urbanwatch'], channels=1)
+            'naip_hist': GeoArrayDataset(self._zarr_root['naip_hist'], channels=1),
+            'naip': GeoArrayDataset(self._zarr_root['naip'], channels=3),
+            'eros_hist': GeoArrayDataset(self._zarr_root['eros_hist'], channels=1),
+            'masks': GeoArrayDataset(self._zarr_root['masks/urbanwatch'], channels=1)
         })
 
         self._logger.info('Loading samplers for tiles')
-        _samplers = GeoSamplerBuilder(
-            boundary_dists=_zarr_root['masks/distances_down'],
-            window_size=self.win_size,
-            steps_per_epoch=self.steps_per_epoch * self.batch_size * self.accumulate)
+        self._samplers = self.samplers()
+    
+        self._train_sampler = self._samplers.dynamic_sampler(self._extract_metadata('train'))
+        self._val_sampler = self._samplers.grid_sampler(self._extract_metadata('val'))
+        self._test_sampler = self._samplers.grid_sampler(self._extract_metadata('test'))
 
-        self._train_sampler = _samplers.training(self._extract_metadata(_zarr_root.root, 'train'))
-        self._val_sampler = _samplers.validation(self._extract_metadata(_zarr_root.root, 'val'))
-        self._test_sampler = _samplers.testing(self._extract_metadata(_zarr_root.root, 'test'))
+    def samplers(self):
+        if not hasattr(self, '_zarr_root'):
+            raise ValueError("Zarr root not loaded. Please call setup() before accessing samplers.")
+
+        return GeoSamplerBuilder(
+            boundary_dists=self._zarr_root['masks/distances_down'],
+            window_size=self.win_size,
+            steps_per_epoch=self.steps_per_epoch * self.batch_size * self.accumulate
+        )
+
+    def dataset(self, transforms):        
+        if not hasattr(self, '_zarr_root'):
+            raise ValueError("Zarr root not loaded. Please call setup() before accessing dataset.")
+
+        return ChronosDataset(self._sets, transforms, self.keep_query)
 
     def train_dataloader(self) -> DataLoader:
         """Get the Chronos training DataLoader.
@@ -145,11 +163,10 @@ class ChronosDataModule(LightningDataModule):
         :return: The Chronos training DataLoader
         :rtype: DataLoader
         """
-        ds = ChronosDataset(self._sets, self.train_transform, self.keep_query)
-        return DataLoader(ds,
+        return DataLoader(self.dataset(self.train_transform),
             batch_size=self.batch_size,
-            #persistent_workers=True,
-            #num_workers=self.workers,
+            persistent_workers=True,
+            num_workers=self.workers,
             sampler=self._train_sampler,
             collate_fn=self._collator)
 
@@ -159,8 +176,7 @@ class ChronosDataModule(LightningDataModule):
         :return: The Chronos validation DataLoader
         :rtype: DataLoader
         """
-        ds = ChronosDataset(self._sets, self.test_transform, self.keep_query)
-        return DataLoader(ds,
+        return DataLoader(self.dataset(self.test_transform),
             batch_size=self.batch_size,
             persistent_workers=True,
             num_workers=self.workers,
@@ -173,8 +189,7 @@ class ChronosDataModule(LightningDataModule):
         :return: The Chronos test DataLoader
         :rtype: DataLoader
         """
-        ds = ChronosDataset(self._sets, self.test_transform, self.keep_query)
-        return DataLoader(ds,
+        return DataLoader(self.dataset(self.test_transform),
             batch_size=self.batch_size,
             persistent_workers=True,
             num_workers=self.workers,
